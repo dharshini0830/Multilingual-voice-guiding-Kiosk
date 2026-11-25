@@ -1,0 +1,6 @@
+{
+  "name": "Multilingual Voice Guided Kiosk",
+  "description": "An AI-powered public-service accessibility kiosk platform featuring 10-language voice guidance, OCR and QR autofill, address intelligence, and instant thermal receipt printing.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
