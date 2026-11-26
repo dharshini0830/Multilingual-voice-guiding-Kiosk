@@ -22,7 +22,6 @@ export interface TranslationDictionary {
     dashboard: string;
     documentScan: string;
     ocrReview: string;
-    qrScan: string;
     voiceForm: string;
     review: string;
     completion: string;
@@ -80,9 +79,6 @@ export interface TranslationDictionary {
       ocrTitle: string;
       ocrDesc: string;
       ocrBtn: string;
-      qrTitle: string;
-      qrDesc: string;
-      qrBtn: string;
       voiceTitle: string;
       voiceDesc: string;
       voiceBtn: string;
@@ -136,26 +132,12 @@ export interface TranslationDictionary {
     voiceRefillTitle: string;
     voiceRefillDesc: string;
     speakFieldBtn: string;
-  };
-  qr: {
-    title: string;
-    subtitle: string;
-    instructions: string;
-    startCameraBtn: string;
-    stopCameraBtn: string;
-    uploadQrBtn: string;
-    scanningActive: string;
-    detectedTitle: string;
-    unverifiedWarning: string;
-    formatLabel: string;
-    applyBtn: string;
-    manualFallbackBtn: string;
-    invalidQrError: string;
-    cameraError: string;
-    unsupportedFormat: string;
-    voiceGuide: string;
-    voiceSuccess: string;
-    voiceError: string;
+    addAnotherBtn: string;
+    pageLabel: string; // e.g., "Page {num}"
+    removePageBtn: string;
+    multiPageHint: string;
+    maxPagesNotice: string;
+    scanProgressPage: string; // e.g., "Scanning page {current} of {total}..."
   };
   form: {
     title: string;
@@ -246,5 +228,19 @@ export interface TranslationDictionary {
     voiceSuccess: string;
     voiceExit: string;
     receiptFooterNote: string;
+  };
+  account: {
+    signInBtn: string;
+    signOutBtn: string;
+    signingInStatus: string;
+    signedInAs: string;
+    cloudSyncActive: string;
+    cloudPromptTitle: string;
+    cloudPromptDesc: string;
+    draftRestoredNotice: string;
+    savedApplicationsTitle: string;
+    noSavedApplications: string;
+    downloadReceiptBtn: string;
+    signInError: string;
   };
 }

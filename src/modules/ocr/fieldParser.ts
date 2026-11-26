@@ -12,7 +12,7 @@ function toConfidenceLabel(score: number): FieldConfidence {
 function makeMeta(
   value: string,
   score: number,
-  source: 'ocr' | 'qr' = 'ocr'
+  source: 'ocr' = 'ocr'
 ): ExtractedFieldMeta {
   const clean = value.trim();
   const effectiveScore = clean ? score : 0;
@@ -86,10 +86,28 @@ function hasMixedLatinAndIndic(str: string): boolean {
 
 function cleanNameLine(raw: string): string {
   return raw
+    .replace(/^\s*To\s*[:,\-]\s*/i, '')
     .replace(/^[^A-Za-z\u0600-\u06FF\u0900-\u0DFF]+/, '')
     .replace(/[^A-Za-z.\s\u0600-\u06FF\u0900-\u0DFF]+$/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function isCleanLatinNameToken(token: string): boolean {
+  const bare = token.replace(/\./g, '');
+  if (!bare) return false;
+  // Leading/trailing hyphen or apostrophe inside token like "-rT" or "foo-" is OCR noise
+  if (/^[-']|[-']$/.test(bare)) return false;
+  if (/[^A-Za-z\-']/.test(bare)) return false;
+  // Reject mixed internal lowercase->uppercase OCR hallucination like "sgariLne" or "rT"
+  if (/[a-z][A-Z]/.test(bare) && !/^(?:Mc|Mac)[A-Z][a-z]+$/.test(bare)) return false;
+  // Single/double letter uppercase initials (e.g. "S.", "K", "M.K") are valid
+  if (bare.length <= 2) {
+    return /^[A-Z]{1,2}$/.test(bare) || /^(?:al|el|de|da|la|om|ji)$/i.test(bare);
+  }
+  // 3+ letter Latin name word must contain at least one vowel
+  if (!/[aeiouyAEIOUY]/.test(bare)) return false;
+  return true;
 }
 
 function isReasonableName(line: string): boolean {
@@ -97,27 +115,111 @@ function isReasonableName(line: string): boolean {
   if (clean.length < 3 || clean.length > 65) return false;
   if (isBoilerplateLine(clean)) return false;
   if (/\d/.test(clean)) return false;
-  if (/[\[\]{}|<>~`^*_=+]/.test(line)) return false;
+  if (/[\[\]{}|<>~`^*_=+:;]/.test(line)) return false;
   // Reject mixed Latin+Indic OCR hallucinations like "ந ட் Pr"
   if (hasMixedLatinAndIndic(clean)) return false;
   if (
-    /\b(male|female|transgender|dob|d0b|birth|year|address|pincode|pin|mobile|phone|father|mother|husband|guardian|street|road|nagar|chennai|tamil|nadu)\b/i.test(
+    /\b(male|female|transgender|dob|d0b|birth|year|address|pincode|pin|mobile|phone|father|mother|husband|guardian|street|road|nagar|colony|cross|main|sector|block|phase|floor|flat|chennai|tamil|nadu)\b/i.test(
       clean
     )
   ) {
     return false;
   }
-  const tokens = clean.split(' ').filter(Boolean);
+
+  // Strip a standalone leading "To " mailing prefix before checking tokens
+  const withoutTo = clean.replace(/^To\s+/i, '').trim();
+  const target = withoutTo.length >= 3 && withoutTo !== clean ? withoutTo : clean;
+  if (/^(?:to|or|and|for|the|re|of|in|on|at|by|dio|sio|wio|cio|vid|yob|uid)$/i.test(target)) {
+    return false;
+  }
+
+  const tokens = target.split(' ').filter(Boolean);
   if (tokens.length === 0 || tokens.length > 6) return false;
-  // Require majority of tokens to be real words (>= 2 base chars) so "ந ட் Pr" fails
-  const realWordTokens = tokens.filter((tk) => tk.replace(/\./g, '').length >= 2);
-  if (realWordTokens.length === 0) return false;
-  if (tokens.length >= 2 && realWordTokens.length / tokens.length < 0.6) return false;
+
+  // Reject if a majority of tokens are lowercase 1-2 char English stop/noise words ("to or")
+  const hasLatin = /[A-Za-z]/.test(target);
+  if (hasLatin) {
+    for (const tk of tokens) {
+      if (!isCleanLatinNameToken(tk)) return false;
+    }
+    const substantialLatin = tokens.filter((tk) => tk.replace(/\./g, '').length >= 3);
+    if (substantialLatin.length === 0) return false;
+    const stopWords = tokens.filter((tk) =>
+      /^(?:to|or|and|the|of|in|on|at|by|for|re|be|is|it|as|an)$/i.test(tk)
+    );
+    if (stopWords.length > 0) return false;
+  } else {
+    // Indic/Urdu script checks: require majority of tokens to have >= 2 chars
+    const realWordTokens = tokens.filter((tk) => tk.replace(/\./g, '').length >= 2);
+    if (realWordTokens.length === 0) return false;
+    if (tokens.length >= 2 && realWordTokens.length / tokens.length < 0.6) return false;
+  }
+
   return true;
 }
 
 function normalizeDateString(raw: string): string {
   return normalizeDobFormat(raw);
+}
+
+const VALID_SHORT_ADDRESS_TOKENS = new Set([
+  'no', 'st', 'rd', 'dr', 'ln', 'bl', 'fl', 'pt', 'po', 'ps', 'co', 'so', 'do', 'wo',
+  '1st', '2nd', '3rd', 'e', 'w', 'n', 's', 'a', 'b', 'c', 'd', 'in', 'up', 'ap', 'tn', 'ka', 'kl', 'mh', 'dl', 'gj', 'rj', 'wb', 'mp', 'hr', 'pb', 'uk', 'hp', 'jk', 'ts', 'or', 'br', 'jh', 'as', 'ga',
+]);
+
+function cleanAddressSegment(seg: string): string {
+  // Strip stray relationship prefixes, colons, apostrophes, and isolated 1-2 char lowercase junk
+  let s = seg
+    .replace(/^(?:[SDWC]\s*[/|1lI]?\s*[O0]|SIO|DIO|CIO|WIO|To|Re|Ref)\s*[:\-.,']*\s*/gi, '')
+    .replace(/['"`~^_=+|\\<>[\]{}]/g, ' ')
+    .replace(/\s*:\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!s) return '';
+
+  const tokens = s.split(' ').filter(Boolean);
+  const kept: string[] = [];
+  let shortJunkCount = 0;
+
+  for (const tk of tokens) {
+    const bare = tk.replace(/[^A-Za-z0-9\u0600-\u06FF\u0900-\u0DFF]/g, '');
+    if (!bare) continue;
+
+    // Mixed case OCR gibberish like "gvees" is lowercase ok, but "sgariLne" or "-rT" is noise
+    if (/[a-z][A-Z]/.test(bare)) {
+      shortJunkCount++;
+      continue;
+    }
+
+    // Isolated 1-2 char Latin token that isn't a number, uppercase block/sector code, or known address abbr
+    if (/^[a-z]{1,2}$/.test(bare) && !VALID_SHORT_ADDRESS_TOKENS.has(bare)) {
+      shortJunkCount++;
+      continue;
+    }
+
+    if (/^[A-Za-z]{1,2}$/.test(bare) && !VALID_SHORT_ADDRESS_TOKENS.has(bare.toLowerCase()) && tokens.length >= 3) {
+      // Allow single uppercase block letters only right next to numbers/sectors; treat clusters of 2-letter caps like "TX" in "TX pre Arms" cautiously
+      if (/^[A-Za-z]$/.test(bare)) {
+        shortJunkCount++;
+        continue;
+      }
+    }
+
+    kept.push(tk.replace(/^[,.\-:;]+|[,.\-:;]+$/g, ''));
+  }
+
+  const finalTokens = kept.filter(Boolean);
+  if (finalTokens.length === 0) return '';
+  // Reject segment if original segment had heavy gibberish ratio and no digits
+  if (!/\d/.test(s) && shortJunkCount >= 2 && shortJunkCount >= finalTokens.length) {
+    return '';
+  }
+
+  const result = finalTokens.join(' ').trim();
+  if (result.length < 3) return '';
+  if (/^[A-Za-z]{1,2}$/.test(result)) return '';
+  return result;
 }
 
 function cleanAddressText(raw: string, excludeValues: string[]): string {
@@ -128,30 +230,25 @@ function cleanAddressText(raw: string, excludeValues: string[]): string {
       cleaned = cleaned.replace(new RegExp(esc, 'gi'), ' ');
     }
   }
-  // Remove field labels and OCR bracket noise
+  // Remove field labels, relationship prefixes, and OCR bracket noise
   cleaned = cleaned
     .replace(
-      /(?:Father(?:'s)?|Mother(?:'s)?|Husband(?:'s)?|Applicant|Holder)?\s*Name\s*[:\-]?\s*/gi,
+      /(?:Father(?:'s)?|Mother(?:'s)?|Husband(?:'s)?|Guardian(?:'s)?|Applicant|Holder)?\s*Name\s*[:\-]?\s*/gi,
       ' '
     )
+    .replace(/(?:[SDWC]\s*[/|1lI]\s*[O0]|SIO|DIO|CIO|WIO)\s*[:\-.,]?\s*/gi, ' ')
     .replace(/(?:தந்தை|தாய்|தாய|முழுப்|பெயர்|இததை|முகவரி|பிறந்த தேதி|கைபேசி)\s*[:\-]?\s*/g, ' ')
     .replace(/(?:पिता का नाम|माता का नाम|नाम|पता)\s*[:\-]?\s*/g, ' ')
     .replace(/[\[\]{}|<>~`^*_=+]/g, ' ')
     .replace(/\s*,\s*,+/g, ',')
     .replace(/\s+/g, ' ')
-    .replace(/^[,.\s-]+|[,.\s-]+$/g, '')
+    .replace(/^[,.\s:-]+|[,.\s:-]+$/g, '')
     .trim();
 
-  // Filter comma segments that are pure 1-2 char Latin noise or pure single-letter tokens
   const parts = cleaned
     .split(',')
-    .map((p) =>
-      p
-        .replace(/(?:^|\s)[a-z](?=\s|$)/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-    )
-    .filter((p) => p.length >= 3 && !/^[A-Za-z]{1,2}$/.test(p));
+    .map((p) => cleanAddressSegment(p))
+    .filter(Boolean);
 
   return parts.join(', ').trim();
 }
@@ -218,7 +315,7 @@ export function parseOcrTextToFields(
   }
   if (!fields.dob) {
     for (let i = 0; i < lines.length; i++) {
-      const genericDate = /\b(\d{2}[/\-.|]\d{2}[/\-.|](?:19|20)\d{2})\b/.exec(lines[i]);
+      const genericDate = /\b(\d{1,2}[/\-.|]\d{1,2}[/\-.|](?:19|20)\d{2})\b/.exec(lines[i]);
       if (genericDate) {
         const formatted = normalizeDateString(genericDate[1]);
         if (formatted) {
@@ -298,10 +395,10 @@ export function parseOcrTextToFields(
     }
   }
 
-  // 6. Extract Father's / Mother's / Guardian's Name (English + Indic labels)
+  // 6. Extract Father's / Mother's / Guardian's Name (English + Indic labels + D/O, S/O, W/O, C/O)
   let fatherLineIndex = -1;
   const fatherLabelRegex =
-    /(?:[SDWC]\s*[/|]\s*[O0]|SIO|DIO|CIO|Father(?:'s)?\s*Name|Mother(?:'s)?\s*Name|Husband(?:'s)?\s*Name|Guardian(?:'s)?\s*Name|Care\s*Of|தந்தை\s*பெயர்|தாய்\s*பெயர்|தாய\s*பெயர்|கணவர்\s*பெயர்|पिता\s*का\s*नाम|माता\s*का\s*नाम|पति\s*का\s*नाम)\s*[:\-]?\s*(.*)$/i;
+    /(?:[SDWC]\s*[/|1lI]?\s*[O0]|SIO|DIO|CIO|WIO|Father(?:'s)?\s*Name|Mother(?:'s)?\s*Name|Husband(?:'s)?\s*Name|Guardian(?:'s)?\s*Name|Care\s*Of|தந்தை\s*பெயர்|தாய்\s*பெயர்|தாய\s*பெயர்|கணவர்\s*பெயர்|पिता\s*का\s*नाम|माता\s*का\s*नाम|पति\s*का\s*नाम)\s*[:\-.,]?\s*(.*)$/i;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const relLabelMatch = fatherLabelRegex.exec(line);
@@ -313,7 +410,12 @@ export function parseOcrTextToFields(
       const cleanRel = cleanNameLine(
         candidate.split(/[,;]/)[0].replace(/\s+\d+.*$/, '')
       );
-      if (cleanRel.length >= 3 && !isBoilerplateLine(cleanRel) && !hasMixedLatinAndIndic(cleanRel)) {
+      if (
+        cleanRel.length >= 3 &&
+        isReasonableName(cleanRel) &&
+        !isBoilerplateLine(cleanRel) &&
+        !hasMixedLatinAndIndic(cleanRel)
+      ) {
         fields.fatherName = makeMeta(cleanRel, 82);
         fatherLineIndex = i;
         break;
@@ -388,7 +490,7 @@ export function parseOcrTextToFields(
   );
   if (addrStartIdx !== -1) {
     const endIdx =
-      pinLineIndex >= addrStartIdx ? pinLineIndex : Math.min(lines.length - 1, addrStartIdx + 4);
+      pinLineIndex >= addrStartIdx ? pinLineIndex : Math.min(lines.length - 1, addrStartIdx + 5);
     const addrParts: string[] = [];
     for (let k = addrStartIdx; k <= endIdx; k++) {
       const chunk = lines[k]
@@ -443,7 +545,6 @@ export function mergeOcrFieldMaps(
     } else if (!a?.value && b?.value) {
       merged[key] = b;
     } else if (a?.value && b?.value) {
-      // For names/fatherName, prefer clean Latin script if both exist and scores are close
       if ((key === 'fullName' || key === 'fatherName') && /^[A-Za-z.\s]+$/.test(a.value) && !hasMixedLatinAndIndic(a.value)) {
         merged[key] = a.score >= b.score - 12 ? a : b;
       } else if (
@@ -452,6 +553,14 @@ export function mergeOcrFieldMaps(
         hasMixedLatinAndIndic(b.value)
       ) {
         merged[key] = a.score >= b.score - 16 ? a : b;
+      } else if (key === 'address') {
+        if (!hasMixedLatinAndIndic(b.value) && b.value.length > a.value.length * 1.25 && b.score >= 65) {
+          merged[key] = b;
+        } else if (!hasMixedLatinAndIndic(a.value) && a.value.length > b.value.length * 1.25 && a.score >= 65) {
+          merged[key] = a;
+        } else {
+          merged[key] = b.score > a.score ? b : a;
+        }
       } else {
         merged[key] = b.score > a.score ? b : a;
       }
@@ -473,7 +582,7 @@ export function normalizeServerAiFields(
     if (!rawVal) return;
     let score = typeof confObj[key] === 'number' ? Math.round(confObj[key]) : 88;
 
-    let cleanVal = rawVal;
+    let cleanVal = rawVal.replace(/\s+/g, ' ').trim();
     if (key === 'idNumber') {
       const digitsOnly = rawVal.replace(/\D/g, '');
       if (digitsOnly.length === 12) {
@@ -481,21 +590,45 @@ export function normalizeServerAiFields(
         if (!verifyVerhoeffChecksum(cleanVal)) {
           score = Math.min(score, 62);
         }
+      } else if (digitsOnly.length === 16) {
+        // Ignore 16-digit VID if returned erroneously
+        return;
       } else {
         cleanVal = rawVal.replace(/\s+/g, '').toUpperCase();
       }
     } else if (key === 'dob') {
-      cleanVal = normalizeDateString(rawVal) || rawVal;
+      const norm = normalizeDateString(rawVal);
+      if (!norm) return;
+      cleanVal = norm;
     } else if (key === 'gender') {
       const g = rawVal.toLowerCase();
-      if (g === 'f' || g.includes('female')) cleanVal = 'Female';
-      else if (g === 'm' || g.includes('male')) cleanVal = 'Male';
-      else if (g.includes('other') || g.includes('trans')) cleanVal = 'Other';
-      else return;
+      if (g === 'f' || g.includes('female') || /பெண்|महिला|స్త్రీ|మహిళ|ಮಹಿಳೆ|സ്ത്രീ/.test(rawVal)) {
+        cleanVal = 'Female';
+      } else if (g === 'm' || g.includes('male') || /ஆண்|पुरुष|పురుషుడు|ಪುರುಷ|പുരുഷ/.test(rawVal)) {
+        cleanVal = 'Male';
+      } else if (g.includes('other') || g.includes('trans')) {
+        cleanVal = 'Other';
+      } else {
+        return;
+      }
     } else if (key === 'phoneNumber') {
-      cleanVal = rawVal.replace(/\D/g, '').slice(-10);
+      const digits = rawVal.replace(/\D/g, '').slice(-10);
+      if (!/^[6-9]\d{9}$/.test(digits)) return;
+      cleanVal = digits;
     } else if (key === 'pincode') {
-      cleanVal = rawVal.replace(/\D/g, '').slice(0, 6);
+      const pin = rawVal.replace(/\D/g, '').slice(0, 6);
+      if (!/^[1-9]\d{5}$/.test(pin)) return;
+      cleanVal = pin;
+    } else if (key === 'fullName' || key === 'fatherName') {
+      cleanVal = cleanNameLine(rawVal);
+      if (cleanVal.length < 2) return;
+    } else if (key === 'address') {
+      cleanVal = rawVal
+        .replace(/^(?:Address|पता|முகவரி|To)\s*[:\-]?\s*/i, '')
+        .replace(/\s+/g, ' ')
+        .replace(/^[,.\s-]+|[,.\s-]+$/g, '')
+        .trim();
+      if (cleanVal.length < 5) return;
     }
 
     fields[key] = makeMeta(cleanVal, score, 'ocr');

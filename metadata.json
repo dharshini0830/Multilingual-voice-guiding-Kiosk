@@ -1,6 +1,6 @@
 {
   "name": "JanSeva Voice — Multilingual Voice-Guided Form Filling System",
-  "description": "Accessible 12-language voice-guided public service kiosk with local and AI-assisted OCR document scanning, Aadhaar/QR decoding, speech-to-text form filling, and PDF receipt printing.",
+  "description": "Accessible 12-language voice-guided public service kiosk with local and AI-assisted OCR document scanning, speech-to-text form filling, and PDF receipt printing.",
   "requestFramePermissions": ["microphone", "camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

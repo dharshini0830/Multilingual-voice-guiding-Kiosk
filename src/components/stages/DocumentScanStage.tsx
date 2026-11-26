@@ -7,17 +7,21 @@ import {
   Loader2,
   Mic,
   MicOff,
+  Plus,
   RotateCcw,
   RotateCw,
   ScanText,
   Sparkles,
+  Trash2,
   X,
+  ZoomIn,
 } from 'lucide-react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useKiosk } from '@/src/context/KioskContext';
 import { autoFormatDobInput, normalizeDobFormat } from '@/src/modules/form/dobFormatter';
 import { interpolate } from '@/src/modules/i18n';
-import { scanDocumentWithOcr } from '@/src/modules/ocr/ocrScanner';
+import { mergeOcrFieldMaps } from '@/src/modules/ocr/fieldParser';
+import { scanDocumentPagesWithOcr } from '@/src/modules/ocr/ocrScanner';
 import {
   isBrowserSttSupported,
   isMediaRecorderSupported,
@@ -40,6 +44,15 @@ const EDITABLE_OCR_FIELDS: Array<Exclude<FieldKey, 'serviceType'>> = [
   'address',
   'pincode',
 ];
+
+const CAMERA_ZOOM_OPTIONS = [1, 1.5, 2] as const;
+const MAX_DOCUMENT_PAGES = 4;
+
+interface QueuedDocumentPage {
+  id: string;
+  dataUrl: string;
+  rotation: 0 | 90 | 180 | 270;
+}
 
 function isMicPermissionError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
@@ -65,13 +78,16 @@ export function DocumentScanStage() {
     speak,
   } = useKiosk();
 
-  const [sourceImageUrl, setSourceImageUrl] = useState<string | null>(null);
-  const [rotation, setRotation] = useState<0 | 90 | 180 | 270>(0);
+  const [pages, setPages] = useState<QueuedDocumentPage[]>([]);
+  const [appendToExisting, setAppendToExisting] = useState(false);
   const [useAiVerification, setUseAiVerification] = useState(true);
   const [isScanning, setIsScanning] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [scanningPageInfo, setScanningPageInfo] = useState<{ current: number; total: number } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
+  const [cameraZoom, setCameraZoom] = useState<(typeof CAMERA_ZOOM_OPTIONS)[number]>(1);
+  const [isCapturingPhoto, setIsCapturingPhoto] = useState(false);
   const [showRawText, setShowRawText] = useState(false);
 
   // Editable extraction draft (user reviews and corrects via keyboard or voice before applying)
@@ -99,6 +115,7 @@ export function DocumentScanStage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const previousOcrResultRef = useRef<typeof ocrResult>(null);
 
   const fieldSttRef = useRef<{ stop: () => void } | null>(null);
   const fieldRecorderRef = useRef<ClipRecorderHandle | null>(null);
@@ -155,8 +172,35 @@ export function DocumentScanStage() {
   const stopCamera = () => {
     streamRef.current?.getTracks().forEach((tr) => tr.stop());
     streamRef.current = null;
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
     setCameraActive(false);
   };
+
+  useEffect(() => {
+    if (!cameraActive) return;
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (!video || !stream) return;
+
+    video.srcObject = stream;
+    const handleReady = () => {
+      void video.play().catch(() => {
+        // Autoplay blocked fallback handled by user interaction
+      });
+    };
+
+    if (video.readyState >= 1) {
+      handleReady();
+    } else {
+      video.addEventListener('loadedmetadata', handleReady, { once: true });
+    }
+
+    return () => {
+      video.removeEventListener('loadedmetadata', handleReady);
+    };
+  }, [cameraActive]);
 
   const startCamera = async () => {
     setErrorMsg(null);
@@ -166,63 +210,183 @@ export function DocumentScanStage() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: {
+          facingMode: 'environment',
+          width: { ideal: 2560 },
+          height: { ideal: 1440 },
+        },
       });
-      streamRef.current = stream;
-      setCameraActive(true);
-      setTimeout(() => {
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
+
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack && typeof videoTrack.applyConstraints === 'function') {
+        try {
+          await videoTrack.applyConstraints({
+            advanced: [{ focusMode: 'continuous' } as MediaTrackConstraintSet],
+          });
+        } catch {
+          // Focus mode constraint not supported on all cameras; ignore
         }
-      }, 60);
+      }
+
+      streamRef.current = stream;
+      setCameraZoom(1);
+      setCameraActive(true);
     } catch {
       setErrorMsg(t.ocr.cameraDenied);
     }
   };
 
-  const captureFromCamera = () => {
+  const captureFromCamera = async () => {
     const video = videoRef.current;
-    if (!video || video.videoWidth === 0) return;
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = canvas.toDataURL('image/png');
-    setSourceImageUrl(dataUrl);
-    setRotation(0);
-    setOcrResult(null);
-    stopCamera();
-  };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    if (!video || video.videoWidth === 0 || isCapturingPhoto) return;
+    setIsCapturingPhoto(true);
     setErrorMsg(null);
 
-    const validType =
-      file.type === 'image/jpeg' ||
-      file.type === 'image/jpg' ||
-      file.type === 'image/png' ||
-      file.type === 'image/webp';
-    if (!validType || file.size > 10 * 1024 * 1024) {
-      setErrorMsg(t.ocr.invalidFileError);
+    try {
+      const cropSourceToCanvas = (
+        source: CanvasImageSource,
+        srcW: number,
+        srcH: number
+      ): string | null => {
+        const zoomFactor = cameraZoom > 1 ? cameraZoom : 1;
+        // Trim outer 4% border at 1x to align closer to the dashed guide box and exclude desk shadows
+        const margin = zoomFactor === 1 ? 0.04 : 0;
+        const cw = Math.max(1, Math.round((srcW / zoomFactor) * (1 - margin * 2)));
+        const ch = Math.max(1, Math.round((srcH / zoomFactor) * (1 - margin * 2)));
+        const sx = Math.max(0, Math.round((srcW - cw) / 2));
+        const sy = Math.max(0, Math.round((srcH - ch) / 2));
+
+        const targetW = Math.min(2400, Math.max(1600, cw));
+        const targetH = Math.round(targetW * (ch / cw));
+
+        const canvas = document.createElement('canvas');
+        canvas.width = targetW;
+        canvas.height = targetH;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return null;
+
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(source, sx, sy, cw, ch, 0, 0, targetW, targetH);
+        return canvas.toDataURL('image/jpeg', 0.95);
+      };
+
+      let dataUrl: string | null = null;
+
+      // Prefer full-sensor hardware still photo when ImageCapture is available
+      const track = streamRef.current?.getVideoTracks()[0];
+      const ImageCaptureCtor = (
+        window as unknown as {
+          ImageCapture?: new (tr: MediaStreamTrack) => { takePhoto: () => Promise<Blob> };
+        }
+      ).ImageCapture;
+
+      if (track && ImageCaptureCtor) {
+        try {
+          const cap = new ImageCaptureCtor(track);
+          const photoBlob = await cap.takePhoto();
+          const bitmap = await createImageBitmap(photoBlob);
+          dataUrl = cropSourceToCanvas(bitmap, bitmap.width, bitmap.height);
+          bitmap.close();
+        } catch {
+          // Fall back cleanly to video stream canvas
+        }
+      }
+
+      if (!dataUrl) {
+        dataUrl = cropSourceToCanvas(video, video.videoWidth, video.videoHeight);
+      }
+
+      if (dataUrl) {
+        setPages((prev) => {
+          if (prev.length >= MAX_DOCUMENT_PAGES) {
+            setErrorMsg(t.ocr.maxPagesNotice);
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              id: `page-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              dataUrl,
+              rotation: 0,
+            },
+          ];
+        });
+        setOcrResult(null);
+        stopCamera();
+      }
+    } finally {
+      setIsCapturingPhoto(false);
+    }
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = Array.from(e.target.files ?? []);
+    e.target.value = '';
+    if (fileList.length === 0) return;
+    setErrorMsg(null);
+
+    const remainingSlots = MAX_DOCUMENT_PAGES - pages.length;
+    if (remainingSlots <= 0) {
+      setErrorMsg(t.ocr.maxPagesNotice);
       return;
     }
 
-    const reader = new FileReader();
-    reader.onload = () => {
-      setSourceImageUrl(String(reader.result));
-      setRotation(0);
+    const acceptedFiles = fileList.slice(0, remainingSlots);
+    if (fileList.length > remainingSlots) {
+      setErrorMsg(t.ocr.maxPagesNotice);
+    }
+
+    const readPromises = acceptedFiles.map(
+      (file) =>
+        new Promise<QueuedDocumentPage | null>((resolve) => {
+          const validType =
+            file.type === 'image/jpeg' ||
+            file.type === 'image/jpg' ||
+            file.type === 'image/png' ||
+            file.type === 'image/webp';
+          if (!validType || file.size > 10 * 1024 * 1024) {
+            setErrorMsg(t.ocr.invalidFileError);
+            resolve(null);
+            return;
+          }
+          const reader = new FileReader();
+          reader.onload = () =>
+            resolve({
+              id: `page-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+              dataUrl: String(reader.result),
+              rotation: 0,
+            });
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(file);
+        })
+    );
+
+    const loaded = (await Promise.all(readPromises)).filter(
+      (p): p is QueuedDocumentPage => p !== null
+    );
+    if (loaded.length > 0) {
+      setPages((prev) => [...prev, ...loaded].slice(0, MAX_DOCUMENT_PAGES));
       setOcrResult(null);
-    };
-    reader.readAsDataURL(file);
-    e.target.value = '';
+    }
+  };
+
+  const rotatePage = (pageId: string, delta: 90 | 270) => {
+    setPages((prev) =>
+      prev.map((p) =>
+        p.id === pageId
+          ? { ...p, rotation: ((p.rotation + delta) % 360) as 0 | 90 | 180 | 270 }
+          : p
+      )
+    );
+  };
+
+  const removePage = (pageId: string) => {
+    setPages((prev) => prev.filter((p) => p.id !== pageId));
   };
 
   const handleRunOcr = async () => {
-    if (!sourceImageUrl) return;
+    if (pages.length === 0) return;
     if (!consentGiven) {
       setConsentGiven(true);
     }
@@ -232,35 +396,65 @@ export function DocumentScanStage() {
     setAllResultBanner(null);
     setIsScanning(true);
     setProgress(0);
+    setScanningPageInfo({ current: 1, total: pages.length });
     speak(t.ocr.voiceScanning, true);
 
     try {
-      const result = await scanDocumentWithOcr(sourceImageUrl, {
-        language,
-        rotationDeg: rotation,
-        useAiVerification,
-        consentGiven: true,
-        onProgress: setProgress,
-      });
+      const prevFields: ExtractionResultMap = appendToExisting ? { ...draftFields } : {};
+      const prevRaw = appendToExisting && previousOcrResultRef.current?.rawText
+        ? previousOcrResultRef.current.rawText.trim()
+        : '';
 
-      const foundCount = Object.values(result.fields).filter((f) => f && f.value).length;
-      if (foundCount === 0 && result.rawText.trim().length < 4) {
-        setErrorMsg(t.ocr.noTextFound);
-        speak(t.ocr.voiceFailed, true);
-        setIsScanning(false);
-        return;
-      }
+      const result = await scanDocumentPagesWithOcr(
+        pages.map((p) => ({ dataUrl: p.dataUrl, rotationDeg: p.rotation })),
+        {
+          language,
+          useAiVerification,
+          consentGiven: true,
+          onProgress: (pct) => setProgress(pct),
+          onPageProgress: (current, total, pct) => {
+            setScanningPageInfo({ current, total });
+            setProgress(pct);
+          },
+        }
+      );
 
-      const normalizedFields = { ...result.fields };
-      if (normalizedFields.dob?.value) {
-        const normDob = normalizeDobFormat(normalizedFields.dob.value);
+      let combinedFields = appendToExisting
+        ? mergeOcrFieldMaps(prevFields, result.fields)
+        : { ...result.fields };
+
+      if (combinedFields.dob?.value) {
+        const normDob = normalizeDobFormat(combinedFields.dob.value);
         if (normDob) {
-          normalizedFields.dob = { ...normalizedFields.dob, value: normDob };
+          combinedFields.dob = { ...combinedFields.dob, value: normDob };
         }
       }
 
-      setOcrResult({ ...result, fields: normalizedFields });
-      setDraftFields(normalizedFields);
+      const foundCount = Object.values(combinedFields).filter((f) => f && f.value).length;
+      const combinedRawText = [prevRaw, result.rawText.trim()].filter(Boolean).join('\n\n');
+      if (foundCount === 0 && combinedRawText.trim().length < 4) {
+        setErrorMsg(t.ocr.noTextFound);
+        speak(t.ocr.voiceFailed, true);
+        setIsScanning(false);
+        setScanningPageInfo(null);
+        return;
+      }
+
+      const warnings = new Set<string>(result.warnings);
+      if (appendToExisting && previousOcrResultRef.current?.warnings) {
+        previousOcrResultRef.current.warnings.forEach((w) => warnings.add(w));
+      }
+
+      setOcrResult({
+        rawText: combinedRawText,
+        fields: combinedFields,
+        overallConfidence: result.overallConfidence,
+        engine: result.engine,
+        preprocessedDataUrl: result.preprocessedDataUrl || pages[0].dataUrl,
+        warnings: Array.from(warnings),
+      });
+      setDraftFields(combinedFields);
+      setAppendToExisting(false);
       if (foundCount >= 4) {
         speak(t.ocr.voiceSuccess, true);
       } else {
@@ -271,6 +465,7 @@ export function DocumentScanStage() {
       speak(t.ocr.voiceFailed, true);
     } finally {
       setIsScanning(false);
+      setScanningPageInfo(null);
     }
   };
 
@@ -644,21 +839,26 @@ export function DocumentScanStage() {
         {/* Step A: Upload / Camera Capture (when not yet reviewed) */}
         {!ocrResult && (
           <div className="mt-6 space-y-6">
-            <p className="text-sm sm:text-base font-medium text-slate-700">{t.ocr.instructions}</p>
+            <div className="space-y-1">
+              <p className="text-sm sm:text-base font-medium text-slate-700">{t.ocr.instructions}</p>
+              <p className="text-xs sm:text-sm text-blue-900 font-medium">{t.ocr.multiPageHint}</p>
+            </div>
 
             {/* Upload / Camera action buttons */}
             <div className="flex flex-wrap items-center gap-3">
               <input
                 ref={fileInputRef}
                 type="file"
+                multiple
                 accept="image/jpeg,image/jpg,image/png,image/webp"
-                onChange={handleFileChange}
+                onChange={(e) => void handleFileChange(e)}
                 className="hidden"
               />
               <button
                 type="button"
+                disabled={pages.length >= MAX_DOCUMENT_PAGES || isScanning}
                 onClick={() => fileInputRef.current?.click()}
-                className="inline-flex min-h-[52px] items-center gap-2.5 rounded-xl bg-blue-900 px-5 py-3 text-base font-bold text-white hover:bg-blue-800 cursor-pointer"
+                className="inline-flex min-h-[52px] items-center gap-2.5 rounded-xl bg-blue-900 px-5 py-3 text-base font-bold text-white hover:bg-blue-800 disabled:opacity-50 cursor-pointer"
               >
                 <FileUp className="h-5 w-5" aria-hidden="true" />
                 <span>{t.ocr.uploadBtn}</span>
@@ -667,8 +867,9 @@ export function DocumentScanStage() {
               {!cameraActive ? (
                 <button
                   type="button"
+                  disabled={pages.length >= MAX_DOCUMENT_PAGES || isScanning}
                   onClick={startCamera}
-                  className="inline-flex min-h-[52px] items-center gap-2.5 rounded-xl border border-slate-300 bg-slate-50 px-5 py-3 text-base font-bold text-slate-900 hover:bg-slate-100 cursor-pointer"
+                  className="inline-flex min-h-[52px] items-center gap-2.5 rounded-xl border border-slate-300 bg-slate-50 px-5 py-3 text-base font-bold text-slate-900 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
                 >
                   <Camera className="h-5 w-5 text-blue-900" aria-hidden="true" />
                   <span>{t.ocr.cameraBtn}</span>
@@ -683,6 +884,22 @@ export function DocumentScanStage() {
                   <span>{t.ocr.stopCameraBtn}</span>
                 </button>
               )}
+
+              {appendToExisting && previousOcrResultRef.current && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopCamera();
+                    setPages([]);
+                    setAppendToExisting(false);
+                    setOcrResult(previousOcrResultRef.current);
+                    previousOcrResultRef.current = null;
+                  }}
+                  className="inline-flex min-h-[52px] items-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-3 text-base font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer"
+                >
+                  <span>{t.app.cancelBtn}</span>
+                </button>
+              )}
             </div>
 
             {errorMsg && (
@@ -695,51 +912,81 @@ export function DocumentScanStage() {
             {/* Live Camera Preview */}
             {cameraActive && (
               <div className="space-y-4 rounded-xl border border-slate-300 bg-slate-950 p-4">
-                <div className="relative overflow-hidden rounded-lg">
+                <div className="relative mx-auto aspect-video w-full max-w-2xl overflow-hidden rounded-lg bg-black flex items-center justify-center">
                   <video
                     ref={videoRef}
                     autoPlay
                     playsInline
                     muted
-                    className="mx-auto max-h-[380px] w-full object-contain"
+                    style={{ transform: cameraZoom > 1 ? `scale(${cameraZoom})` : undefined }}
+                    className="h-full w-full object-contain transition-transform duration-150"
                   />
-                  {/* Framing guide overlay */}
-                  <div className="pointer-events-none absolute inset-6 rounded-lg border-2 border-dashed border-white/80" />
+                  {/* Framing guide overlay aligned with 4% inner capture crop */}
+                  <div className="pointer-events-none absolute inset-4 rounded-lg border-2 border-dashed border-white/85" />
                 </div>
-                <div className="flex justify-center">
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <div className="inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 p-1">
+                    <ZoomIn className="ml-1.5 mr-1 h-4 w-4 text-slate-300" aria-hidden="true" />
+                    {CAMERA_ZOOM_OPTIONS.map((z) => (
+                      <button
+                        key={z}
+                        type="button"
+                        onClick={() => setCameraZoom(z)}
+                        className={`min-h-[36px] rounded-md px-2.5 py-1 text-xs font-bold cursor-pointer ${
+                          cameraZoom === z
+                            ? 'bg-white text-slate-900'
+                            : 'text-slate-300 hover:bg-slate-800 hover:text-white'
+                        }`}
+                      >
+                        {z}x
+                      </button>
+                    ))}
+                  </div>
+
                   <button
                     type="button"
-                    onClick={captureFromCamera}
-                    className="inline-flex min-h-[52px] items-center gap-2 rounded-xl bg-white px-6 py-3 text-base font-bold text-slate-900 hover:bg-slate-100 cursor-pointer"
+                    disabled={isCapturingPhoto}
+                    onClick={() => void captureFromCamera()}
+                    className="inline-flex min-h-[52px] items-center gap-2 rounded-xl bg-white px-6 py-3 text-base font-bold text-slate-900 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
                   >
-                    <Camera className="h-5 w-5" aria-hidden="true" />
-                    <span>{t.ocr.captureBtn}</span>
+                    {isCapturingPhoto ? (
+                      <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
+                    ) : (
+                      <Camera className="h-5 w-5" aria-hidden="true" />
+                    )}
+                    <span>{isCapturingPhoto ? t.ocr.processingStatus : t.ocr.captureBtn}</span>
                   </button>
                 </div>
               </div>
             )}
 
-            {/* Selected Image Preview + Rotation + AI Toggle */}
-            {sourceImageUrl && !cameraActive && (
-              <div className="space-y-4 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:p-6">
+            {/* Selected Multi-Page Image Queue + Per-Page Rotation + AI Toggle */}
+            {pages.length > 0 && !cameraActive && (
+              <div className="space-y-5 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:p-6">
                 <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setRotation((r) => (((r + 270) % 360) as 0 | 90 | 180 | 270))}
-                      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
-                    >
-                      <RotateCcw className="h-4 w-4" aria-hidden="true" />
-                      <span>{t.ocr.rotateLeft}</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRotation((r) => (((r + 90) % 360) as 0 | 90 | 180 | 270))}
-                      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
-                    >
-                      <RotateCw className="h-4 w-4" aria-hidden="true" />
-                      <span>{t.ocr.rotateRight}</span>
-                    </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {pages.length < MAX_DOCUMENT_PAGES && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={isScanning}
+                          onClick={() => fileInputRef.current?.click()}
+                          className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-blue-900 bg-white px-3.5 py-2 text-sm font-bold text-blue-900 hover:bg-blue-50 disabled:opacity-50 cursor-pointer"
+                        >
+                          <Plus className="h-4 w-4" aria-hidden="true" />
+                          <span>{t.ocr.addAnotherBtn}</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isScanning}
+                          onClick={startCamera}
+                          className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                        >
+                          <Camera className="h-4 w-4 text-blue-900" aria-hidden="true" />
+                          <span>{t.ocr.cameraBtn}</span>
+                        </button>
+                      </>
+                    )}
                   </div>
 
                   <label className="flex items-center gap-2.5 text-sm font-medium text-slate-800 cursor-pointer">
@@ -753,20 +1000,75 @@ export function DocumentScanStage() {
                   </label>
                 </div>
 
-                <div className="flex justify-center overflow-hidden rounded-lg border border-slate-300 bg-white p-3">
-                  <img
-                    src={sourceImageUrl}
-                    alt="Document preview"
-                    style={{ transform: `rotate(${rotation}deg)` }}
-                    className="max-h-[340px] object-contain transition-transform"
-                  />
+                <div className={`grid gap-4 ${pages.length === 1 ? 'grid-cols-1' : 'grid-cols-1 md:grid-cols-2'}`}>
+                  {pages.map((page, index) => (
+                    <div
+                      key={page.id}
+                      className="flex flex-col gap-3 rounded-xl border border-slate-300 bg-white p-3.5"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="inline-flex items-center rounded-md bg-blue-900 px-2.5 py-1 text-xs font-bold text-white">
+                          {interpolate(t.ocr.pageLabel, { num: index + 1 })}
+                        </span>
+
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={isScanning}
+                            onClick={() => rotatePage(page.id, 270)}
+                            aria-label={`${t.ocr.rotateLeft} (${interpolate(t.ocr.pageLabel, { num: index + 1 })})`}
+                            className="inline-flex min-h-[38px] items-center gap-1 rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
+                          >
+                            <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>{t.ocr.rotateLeft}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isScanning}
+                            onClick={() => rotatePage(page.id, 90)}
+                            aria-label={`${t.ocr.rotateRight} (${interpolate(t.ocr.pageLabel, { num: index + 1 })})`}
+                            className="inline-flex min-h-[38px] items-center gap-1 rounded-lg border border-slate-300 bg-slate-50 px-2.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
+                          >
+                            <RotateCw className="h-3.5 w-3.5" aria-hidden="true" />
+                            <span>{t.ocr.rotateRight}</span>
+                          </button>
+                          <button
+                            type="button"
+                            disabled={isScanning}
+                            onClick={() => removePage(page.id)}
+                            aria-label={`${t.ocr.removePageBtn} (${interpolate(t.ocr.pageLabel, { num: index + 1 })})`}
+                            className="inline-flex min-h-[38px] items-center gap-1 rounded-lg border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs font-semibold text-red-800 hover:bg-red-100 cursor-pointer"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="flex justify-center overflow-hidden rounded-lg border border-slate-200 bg-slate-50 p-2">
+                        <img
+                          src={page.dataUrl}
+                          alt={interpolate(t.ocr.pageLabel, { num: index + 1 })}
+                          style={{ transform: `rotate(${page.rotation}deg)` }}
+                          className="max-h-[280px] object-contain transition-transform"
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
 
                 {isScanning ? (
                   <div className="space-y-2 py-2">
                     <div className="flex items-center justify-center gap-2.5 text-base font-semibold text-blue-900">
                       <Loader2 className="h-5 w-5 animate-spin" aria-hidden="true" />
-                      <span>{t.ocr.processingStatus} ({progress}%)</span>
+                      <span>
+                        {scanningPageInfo && scanningPageInfo.total > 1
+                          ? interpolate(t.ocr.scanProgressPage, {
+                              current: scanningPageInfo.current,
+                              total: scanningPageInfo.total,
+                            })
+                          : t.ocr.processingStatus}{' '}
+                        ({progress}%)
+                      </span>
                     </div>
                     <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-200">
                       <div
@@ -779,7 +1081,7 @@ export function DocumentScanStage() {
                   <div className="flex justify-end">
                     <button
                       type="button"
-                      onClick={handleRunOcr}
+                      onClick={() => void handleRunOcr()}
                       className="inline-flex min-h-[54px] items-center gap-2.5 rounded-xl bg-blue-900 px-7 py-3 text-base font-bold text-white hover:bg-blue-800 cursor-pointer"
                     >
                       <ScanText className="h-5 w-5" aria-hidden="true" />
@@ -800,17 +1102,37 @@ export function DocumentScanStage() {
                 <h2 className="text-xl font-bold text-slate-900">{t.ocr.reviewTitle}</h2>
                 <p className="mt-1 text-sm sm:text-base text-slate-600">{t.ocr.reviewSubtitle}</p>
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  stopAllVoiceCaptures();
-                  setOcrResult(null);
-                  setErrorMsg(null);
-                }}
-                className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer shrink-0"
-              >
-                {t.ocr.rescanBtn}
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopAllVoiceCaptures();
+                    previousOcrResultRef.current = ocrResult;
+                    setPages([]);
+                    setAppendToExisting(true);
+                    setOcrResult(null);
+                    setErrorMsg(null);
+                  }}
+                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border border-blue-900 bg-blue-50 px-4 py-2 text-sm font-bold text-blue-900 hover:bg-blue-100 cursor-pointer"
+                >
+                  <Plus className="h-4 w-4" aria-hidden="true" />
+                  <span>{t.ocr.addAnotherBtn}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    stopAllVoiceCaptures();
+                    previousOcrResultRef.current = null;
+                    setPages([]);
+                    setAppendToExisting(false);
+                    setOcrResult(null);
+                    setErrorMsg(null);
+                  }}
+                  className="min-h-[44px] rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-100 cursor-pointer"
+                >
+                  {t.ocr.rescanBtn}
+                </button>
+              </div>
             </div>
 
             {ocrResult.warnings.length > 0 && (

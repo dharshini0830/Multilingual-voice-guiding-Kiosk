@@ -18,7 +18,6 @@ export type WorkflowStage =
   | 'dashboard'
   | 'document-scan'
   | 'ocr-review'
-  | 'qr-scan'
   | 'voice-form'
   | 'review'
   | 'completion';
@@ -60,7 +59,7 @@ export interface ExtractedFieldMeta {
   value: string;
   confidence: FieldConfidence;
   score: number; // 0-100
-  source: 'ocr' | 'qr' | 'voice' | 'manual';
+  source: 'ocr' | 'voice' | 'manual';
   needsReview: boolean;
 }
 
@@ -72,14 +71,6 @@ export interface OcrScanResult {
   overallConfidence: number;
   engine: 'tesseract-local' | 'gemini-enhanced';
   preprocessedDataUrl: string;
-  warnings: string[];
-}
-
-export interface QrScanResult {
-  rawPayload: string;
-  format: 'aadhaar-secure' | 'aadhaar-xml' | 'json' | 'vcard' | 'key-value' | 'text' | 'url';
-  fields: ExtractionResultMap;
-  isStructuredIdentity: boolean;
   warnings: string[];
 }
 

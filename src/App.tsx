@@ -1,5 +1,6 @@
 import { X } from 'lucide-react';
 import { useState } from 'react';
+import { ErrorBoundary } from '@/src/components/ErrorBoundary';
 import { PrintableReceipt } from '@/src/components/PrintableReceipt';
 import { TopBar } from '@/src/components/TopBar';
 import { VoiceControlBar } from '@/src/components/VoiceControlBar';
@@ -7,10 +8,10 @@ import { CompletionStage } from '@/src/components/stages/CompletionStage';
 import { DashboardStage } from '@/src/components/stages/DashboardStage';
 import { DocumentScanStage } from '@/src/components/stages/DocumentScanStage';
 import { LanguageStage } from '@/src/components/stages/LanguageStage';
-import { QrScanStage } from '@/src/components/stages/QrScanStage';
 import { ReviewSubmitStage } from '@/src/components/stages/ReviewSubmitStage';
 import { VoiceFormStage } from '@/src/components/stages/VoiceFormStage';
 import { WelcomeStage } from '@/src/components/stages/WelcomeStage';
+import { FirebaseProvider } from '@/src/context/FirebaseContext';
 import { KioskProvider, useKiosk } from '@/src/context/KioskContext';
 
 function KioskShell() {
@@ -30,7 +31,6 @@ function KioskShell() {
         {stage === 'language' && <LanguageStage />}
         {stage === 'dashboard' && <DashboardStage />}
         {(stage === 'document-scan' || stage === 'ocr-review') && <DocumentScanStage />}
-        {stage === 'qr-scan' && <QrScanStage />}
         {stage === 'voice-form' && <VoiceFormStage />}
         {stage === 'review' && <ReviewSubmitStage />}
         {stage === 'completion' && <CompletionStage />}
@@ -68,8 +68,12 @@ function KioskShell() {
 
 export default function App() {
   return (
-    <KioskProvider>
-      <KioskShell />
-    </KioskProvider>
+    <ErrorBoundary>
+      <FirebaseProvider>
+        <KioskProvider>
+          <KioskShell />
+        </KioskProvider>
+      </FirebaseProvider>
+    </ErrorBoundary>
   );
 }

@@ -26,47 +26,56 @@ export function clearSessionToken(): void {
   tokenExpiresAt = 0;
 }
 
-async function authorizedPost<T>(url: string, body: unknown): Promise<T> {
+async function authorizedPost<T>(url: string, body: unknown, timeoutMs?: number): Promise<T> {
   const token = await ensureSessionToken();
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-  });
+  const controller = timeoutMs ? new AbortController() : undefined;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
 
-  if (res.status === 401) {
-    // Refresh token once and retry
-    clearSessionToken();
-    const freshToken = await ensureSessionToken();
-    const retryRes = await fetch(url, {
+  try {
+    const res = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${freshToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify(body),
+      signal: controller?.signal,
     });
-    const retryData = await retryRes.json();
-    if (!retryRes.ok) {
-      throw Object.assign(new Error(retryData?.error || 'Request failed'), {
-        status: retryRes.status,
-        data: retryData,
+
+    if (res.status === 401) {
+      // Refresh token once and retry
+      clearSessionToken();
+      const freshToken = await ensureSessionToken();
+      const retryRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${freshToken}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller?.signal,
+      });
+      const retryData = await retryRes.json();
+      if (!retryRes.ok) {
+        throw Object.assign(new Error(retryData?.error || 'Request failed'), {
+          status: retryRes.status,
+          data: retryData,
+        });
+      }
+      return retryData as T;
+    }
+
+    const data = await res.json();
+    if (!res.ok) {
+      throw Object.assign(new Error(data?.error || 'Request failed'), {
+        status: res.status,
+        data,
       });
     }
-    return retryData as T;
+    return data as T;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-
-  const data = await res.json();
-  if (!res.ok) {
-    throw Object.assign(new Error(data?.error || 'Request failed'), {
-      status: res.status,
-      data,
-    });
-  }
-  return data as T;
 }
 
 export async function submitFormToServer(
@@ -97,12 +106,13 @@ export interface ServerAiOcrResponse {
 }
 
 export async function requestAiOcrExtraction(params: {
-  imageBase64: string;
-  mimeType: string;
+  imageBase64?: string;
+  mimeType?: string;
+  images?: Array<{ imageBase64: string; mimeType: string }>;
   language: LanguageCode;
   consentGiven: boolean;
 }): Promise<ServerAiOcrResponse> {
-  return authorizedPost<ServerAiOcrResponse>('/api/ocr/extract', params);
+  return authorizedPost<ServerAiOcrResponse>('/api/ocr/extract', params, 45_000);
 }
 
 export async function requestServerTts(params: {

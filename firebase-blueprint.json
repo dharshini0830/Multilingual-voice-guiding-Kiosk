@@ -1,0 +1,247 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Publicly scoped non-PII citizen account settings and language preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "preferredLanguage": {
+          "type": "string",
+          "enum": ["en", "ta", "hi", "te", "kn", "ml", "bn", "mr", "gu", "pa", "or", "ur"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "preferredLanguage", "createdAt", "updatedAt"]
+    },
+    "UserPrivateAccount": {
+      "title": "UserPrivateAccount",
+      "description": "Isolated private account contact metadata (email) restricted strictly to the owner.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 254
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "updatedAt"]
+    },
+    "FormDraft": {
+      "title": "FormDraft",
+      "description": "Owner-isolated in-progress citizen application draft for cross-session and cross-device resumption.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "language": {
+          "type": "string",
+          "enum": ["en", "ta", "hi", "te", "kn", "ml", "bn", "mr", "gu", "pa", "or", "ur"]
+        },
+        "serviceType": {
+          "type": "string",
+          "enum": ["citizen_certificate", "pension_welfare", "ration_card", "bank_kyc"]
+        },
+        "fullName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "idNumber": {
+          "type": "string",
+          "maxLength": 12,
+          "pattern": "^[0-9]{0,12}$"
+        },
+        "dob": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "gender": {
+          "type": "string",
+          "enum": ["", "Male", "Female", "Other"]
+        },
+        "fatherName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "phoneNumber": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[0-9]{0,10}$"
+        },
+        "address": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "pincode": {
+          "type": "string",
+          "maxLength": 6,
+          "pattern": "^[0-9]{0,6}$"
+        },
+        "consentGiven": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "language",
+        "serviceType",
+        "fullName",
+        "idNumber",
+        "dob",
+        "gender",
+        "fatherName",
+        "phoneNumber",
+        "address",
+        "pincode",
+        "consentGiven",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ApplicationSubmission": {
+      "title": "ApplicationSubmission",
+      "description": "Immutable submitted service application receipt with masked Aadhaar number.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "referenceId": {
+          "type": "string",
+          "maxLength": 40,
+          "pattern": "^[A-Z0-9\\-]+$"
+        },
+        "submittedAt": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "language": {
+          "type": "string",
+          "enum": ["en", "ta", "hi", "te", "kn", "ml", "bn", "mr", "gu", "pa", "or", "ur"]
+        },
+        "maskedIdNumber": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "status": {
+          "type": "string",
+          "enum": ["submitted"]
+        },
+        "consentTimestamp": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "serviceType": {
+          "type": "string",
+          "enum": ["citizen_certificate", "pension_welfare", "ration_card", "bank_kyc"]
+        },
+        "fullName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "dob": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "gender": {
+          "type": "string",
+          "enum": ["Male", "Female", "Other"]
+        },
+        "fatherName": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "phoneNumber": {
+          "type": "string",
+          "maxLength": 10,
+          "pattern": "^[6-9][0-9]{9}$"
+        },
+        "address": {
+          "type": "string",
+          "maxLength": 240
+        },
+        "pincode": {
+          "type": "string",
+          "maxLength": 6,
+          "pattern": "^[1-9][0-9]{5}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "referenceId",
+        "submittedAt",
+        "language",
+        "maskedIdNumber",
+        "status",
+        "consentTimestamp",
+        "serviceType",
+        "fullName",
+        "dob",
+        "gender",
+        "fatherName",
+        "phoneNumber",
+        "address",
+        "pincode",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User preference profile document (owner-only read/write)."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateAccount" },
+      "description": "Isolated PII subcollection (e.g. account email) readable and writable only by owner."
+    },
+    "/users/{userId}/drafts/{draftId}": {
+      "schema": { "$ref": "#/entities/FormDraft" },
+      "description": "In-progress citizen form drafts synced across sessions for authenticated users."
+    },
+    "/users/{userId}/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/ApplicationSubmission" },
+      "description": "Submitted application receipts persisted per user for PDF re-download and tracking."
+    }
+  }
+}

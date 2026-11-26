@@ -1,4 +1,5 @@
-import { Globe, Home } from 'lucide-react';
+import { Globe, Home, LogIn, LogOut } from 'lucide-react';
+import { useFirebase } from '@/src/context/FirebaseContext';
 import { useKiosk } from '@/src/context/KioskContext';
 import type { WorkflowStage } from '@/src/types/kiosk';
 
@@ -16,7 +17,7 @@ const ORDERED_STEPS: WorkflowStage[] = [
 ];
 
 function getStepIndex(stage: WorkflowStage): number {
-  if (stage === 'document-scan' || stage === 'ocr-review' || stage === 'qr-scan') {
+  if (stage === 'document-scan' || stage === 'ocr-review') {
     return 3;
   }
   const idx = ORDERED_STEPS.indexOf(stage);
@@ -25,6 +26,7 @@ function getStepIndex(stage: WorkflowStage): number {
 
 export function TopBar({ onOpenLanguageSwitcher }: TopBarProps) {
   const { t, stage, setStage, languageConfig } = useKiosk();
+  const { user, signingIn, signInWithGoogle, signOutUser } = useFirebase();
   const currentStep = getStepIndex(stage);
 
   return (
@@ -58,8 +60,34 @@ export function TopBar({ onOpenLanguageSwitcher }: TopBarProps) {
           )}
         </nav>
 
-        {/* Zone 3: Single Primary Language Switcher Action */}
+        {/* Zone 3: Language Switcher & Google Account Sign-In */}
         <div className="flex items-center gap-2 shrink-0">
+          {!user ? (
+            <button
+              type="button"
+              disabled={signingIn}
+              onClick={() => void signInWithGoogle()}
+              className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-900 hover:bg-slate-50 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <LogIn className="h-4 w-4 text-blue-900" aria-hidden="true" />
+              <span className="hidden sm:inline">
+                {signingIn ? t.account.signingInStatus : t.account.signInBtn}
+              </span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void signOutUser()}
+              title={user.displayName || user.email || ''}
+              className="inline-flex min-h-[44px] items-center gap-2 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <LogOut className="h-4 w-4 text-slate-700" aria-hidden="true" />
+              <span className="hidden sm:inline max-w-[140px] truncate">
+                {user.displayName?.split(' ')[0] || t.account.signOutBtn}
+              </span>
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onOpenLanguageSwitcher}

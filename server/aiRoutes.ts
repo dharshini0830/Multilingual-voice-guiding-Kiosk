@@ -61,6 +61,23 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
   throw lastErr;
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(Object.assign(new Error(`${label} timed out after ${timeoutMs}ms`), { status: 504 })),
+          timeoutMs
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function handleAiOcrExtract(req: Request, res: Response): Promise<void> {
   const ai = getGeminiClient();
   if (!ai) {
@@ -71,109 +88,129 @@ export async function handleAiOcrExtract(req: Request, res: Response): Promise<v
     return;
   }
 
-  const { imageBase64, mimeType, consentGiven } = req.body ?? {};
+  const { imageBase64, mimeType, images, consentGiven } = req.body ?? {};
   if (consentGiven !== true) {
     res.status(400).json({ error: 'Explicit user consent is required before scanning a document.' });
     return;
   }
 
-  if (typeof imageBase64 !== 'string' || typeof mimeType !== 'string') {
+  const rawInputs: Array<{ imageBase64: string; mimeType: string }> = Array.isArray(images) && images.length > 0
+    ? images.slice(0, 4)
+    : typeof imageBase64 === 'string' && typeof mimeType === 'string'
+      ? [{ imageBase64, mimeType }]
+      : [];
+
+  if (rawInputs.length === 0) {
     res.status(400).json({ error: 'Invalid image payload.' });
     return;
   }
 
-  const normalizedMime = mimeType.toLowerCase() === 'image/jpg' ? 'image/jpeg' : mimeType.toLowerCase();
-  if (!ALLOWED_IMAGE_MIMES.has(normalizedMime)) {
-    res.status(400).json({ error: 'Only JPG, PNG, and WebP images are supported.' });
-    return;
-  }
-
-  const rawBuffer = Buffer.from(imageBase64, 'base64');
-  if (rawBuffer.byteLength === 0 || rawBuffer.byteLength > 10 * 1024 * 1024) {
-    rawBuffer.fill(0);
-    res.status(400).json({ error: 'Image must be non-empty and under 10 MB.' });
-    return;
-  }
-
-  const promptText = [
-    'You are an expert Indian government identity document OCR reader (Aadhaar, PAN, Voter ID, Driving Licence, Ration Card, Bank Passbook).',
-    'Extract ALL visible printed citizen details accurately from this image.',
-    'STRICT RULES:',
-    '1. Return ONLY information clearly printed in the image. NEVER guess, invent, or fabricate missing fields.',
-    '2. If a field is blurry, unreadable, or absent from the document, return an empty string "".',
-    '3. Preserve personal names and addresses accurately as printed (prefer the English/Latin spelling if both bilingual English and regional script are printed; otherwise preserve the printed script).',
-    '4. For idNumber: extract the 12-digit Aadhaar number (digits only, ignoring 16-digit VID), OR PAN (10 chars), OR Voter ID / Licence number if no Aadhaar is printed.',
-    '5. For phoneNumber: extract the 10-digit Indian mobile number if printed (digits only).',
-    '6. For dob: format strictly as DD/MM/YYYY (e.g. 15/08/1965). If only Year of Birth (YYYY) is printed, return 01/01/YYYY.',
-    '7. For gender: normalize strictly to "Male", "Female", "Other", or "".',
-    '8. For fatherName: extract father/husband/guardian name from S/O, D/O, W/O, C/O, or Father\'s Name if printed (strip the "S/O:" prefix).',
-    '9. For pincode: extract the 6-digit Indian postal PIN code if printed.',
-    '10. Include rawText with the main printed lines and realistic 0-100 confidence scores.',
-  ].join('\n');
-
-  const schema = {
-    type: Type.OBJECT,
-    properties: {
-      fullName: { type: Type.STRING },
-      idNumber: { type: Type.STRING },
-      dob: { type: Type.STRING },
-      gender: { type: Type.STRING },
-      fatherName: { type: Type.STRING },
-      phoneNumber: { type: Type.STRING },
-      address: { type: Type.STRING },
-      pincode: { type: Type.STRING },
-      rawText: { type: Type.STRING },
-      confidence: {
-        type: Type.OBJECT,
-        properties: {
-          fullName: { type: Type.INTEGER },
-          idNumber: { type: Type.INTEGER },
-          dob: { type: Type.INTEGER },
-          gender: { type: Type.INTEGER },
-          fatherName: { type: Type.INTEGER },
-          phoneNumber: { type: Type.INTEGER },
-          address: { type: Type.INTEGER },
-          pincode: { type: Type.INTEGER },
-        },
-      },
-    },
-  };
+  const buffersToZero: Buffer[] = [];
+  const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
 
   try {
+    for (const item of rawInputs) {
+      if (typeof item?.imageBase64 !== 'string' || typeof item?.mimeType !== 'string') {
+        res.status(400).json({ error: 'Invalid image payload.' });
+        return;
+      }
+      const normalizedMime =
+        item.mimeType.toLowerCase() === 'image/jpg' ? 'image/jpeg' : item.mimeType.toLowerCase();
+      if (!ALLOWED_IMAGE_MIMES.has(normalizedMime)) {
+        res.status(400).json({ error: 'Only JPG, PNG, and WebP images are supported.' });
+        return;
+      }
+
+      const rawBuffer = Buffer.from(item.imageBase64, 'base64');
+      buffersToZero.push(rawBuffer);
+      if (rawBuffer.byteLength === 0 || rawBuffer.byteLength > 10 * 1024 * 1024) {
+        res.status(400).json({ error: 'Each image must be non-empty and under 10 MB.' });
+        return;
+      }
+      imageParts.push({ inlineData: { mimeType: normalizedMime, data: item.imageBase64 } });
+    }
+
+    const promptText = [
+      'You are an expert Indian government identity document OCR reader (Aadhaar card/letter/e-Aadhaar front and back, PAN, Voter ID, Driving Licence, Ration Card, Bank Passbook).',
+      imageParts.length > 1
+        ? `You are given ${imageParts.length} photos/pages of the SAME citizen document (for example Front and Back of an Aadhaar card). Combine information cleanly across all pages into ONE unified result.`
+        : 'Inspect the document photo carefully (even if angled, dimly lit, cropped, or slightly soft) and extract ALL clearly visible citizen details.',
+      'STRICT RULES:',
+      '1. Return ONLY details visibly printed on the document. NEVER guess or invent missing values. Leave absent/unreadable fields as "".',
+      '2. Bilingual cards (e.g., Tamil/Hindi/Telugu/Malayalam + English): ALWAYS prefer the clean English/Latin spelling when both scripts are printed for a name or address; if only regional script is printed, output that clean script without garbled Latin symbols.',
+      '3. fullName: extract the cardholder full name cleanly (NOT mailing labels like "To", NOT "Government of India", NOT father/husband name).',
+      '4. idNumber: extract the 12-digit Aadhaar number (digits only, ignoring any 16-digit VID), or PAN (10 chars), or Voter ID / Driving Licence number.',
+      '5. dob: format strictly as DD/MM/YYYY (e.g., 30/08/2006). Look closely at small "DOB:" / "Date of Birth" text. If only Year of Birth (YYYY) is printed, return 01/01/YYYY.',
+      '6. gender: normalize strictly to "Male", "Female", or "Other" (including regional words like பெண்/महिला -> Female, ஆண்/पुरुष -> Male). Return "" if absent.',
+      '7. fatherName: extract the COMPLETE father/mother/husband/guardian name printed after "Father\'s Name", "S/O", "D/O", "W/O", or "C/O" (strip the "S/O:" / "D/O:" prefix, keep full name like "Jeyaraj", never truncate).',
+      '8. phoneNumber: extract the 10-digit Indian mobile number (starting 6-9, digits only) if printed anywhere on the card/letter; do NOT take digits from the 12-digit Aadhaar number.',
+      '9. address: extract the full residential address cleanly (house/door no., street, area, city/district, state, PIN) excluding "To", "Address:", Aadhaar number, and VID. Do not emit garbled characters.',
+      '10. pincode: extract the 6-digit Indian postal PIN code.',
+      '11. rawText: transcribe the readable lines accurately, and set realistic 0-100 confidence scores for each field.',
+    ].join('\n');
+
+    const schema = {
+      type: Type.OBJECT,
+      properties: {
+        fullName: { type: Type.STRING },
+        idNumber: { type: Type.STRING },
+        dob: { type: Type.STRING },
+        gender: { type: Type.STRING },
+        fatherName: { type: Type.STRING },
+        phoneNumber: { type: Type.STRING },
+        address: { type: Type.STRING },
+        pincode: { type: Type.STRING },
+        rawText: { type: Type.STRING },
+        confidence: {
+          type: Type.OBJECT,
+          properties: {
+            fullName: { type: Type.INTEGER },
+            idNumber: { type: Type.INTEGER },
+            dob: { type: Type.INTEGER },
+            gender: { type: Type.INTEGER },
+            fatherName: { type: Type.INTEGER },
+            phoneNumber: { type: Type.INTEGER },
+            address: { type: Type.INTEGER },
+            pincode: { type: Type.INTEGER },
+          },
+        },
+      },
+    };
+
+    const contents = { parts: [...imageParts, { text: promptText }] };
+
     let response;
     try {
-      response = await withRetry(() =>
+      response = await withTimeout(
         ai.models.generateContent({
           model: 'gemini-4-hydrogen',
-          contents: {
-            parts: [
-              { inlineData: { mimeType: normalizedMime, data: imageBase64 } },
-              { text: promptText },
-            ],
-          },
+          contents,
           config: {
             thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: 'application/json',
             responseSchema: schema,
           },
-        })
+        }),
+        10_000,
+        'gemini-4-hydrogen OCR'
       );
     } catch {
-      // Fallback to gemini-3.1-flash-lite if gemini-4-hydrogen experiences high demand (503/429)
-      response = await withRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite',
-          contents: {
-            parts: [
-              { inlineData: { mimeType: normalizedMime, data: imageBase64 } },
-              { text: promptText },
-            ],
-          },
-          config: {
-            responseMimeType: 'application/json',
-            responseSchema: schema,
-          },
-        })
+      // Fast failover to gemini-3.1-flash-lite if gemini-4-hydrogen is slow or temporarily overloaded
+      response = await withRetry(
+        () =>
+          withTimeout(
+            ai.models.generateContent({
+              model: 'gemini-3.1-flash-lite',
+              contents,
+              config: {
+                responseMimeType: 'application/json',
+                responseSchema: schema,
+              },
+            }),
+            14_000,
+            'gemini-3.1-flash-lite OCR'
+          ),
+        1
       );
     }
 
@@ -189,7 +226,9 @@ export async function handleAiOcrExtract(req: Request, res: Response): Promise<v
       detail,
     });
   } finally {
-    rawBuffer.fill(0);
+    for (const buf of buffersToZero) {
+      buf.fill(0);
+    }
   }
 }
 

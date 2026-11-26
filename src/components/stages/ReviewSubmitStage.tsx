@@ -9,15 +9,18 @@ import {
   Volume2,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
+import { useFirebase } from '@/src/context/FirebaseContext';
 import { useKiosk } from '@/src/context/KioskContext';
 import { FORM_FIELDS_ORDER } from '@/src/modules/form/formSchema';
 import { interpolate } from '@/src/modules/i18n';
 import { maskIdForDisplay, validateEntireForm } from '@/src/modules/validation/formValidator';
 import { submitFormToServer } from '@/src/services/apiClient';
+import { clearActiveDraft, saveSubmissionToFirestore } from '@/src/services/firebaseService';
 import type { FieldKey } from '@/src/types/kiosk';
 
 export function ReviewSubmitStage() {
   const { language, t, formData, setStage, setSubmission, setConsentGiven, speak } = useKiosk();
+  const { user } = useFirebase();
 
   const [revealId, setRevealId] = useState(false);
   const [finalConsent, setFinalConsent] = useState(false);
@@ -66,6 +69,10 @@ export function ReviewSubmitStage() {
 
     try {
       const record = await submitFormToServer(formData, language, true);
+      if (user && user.emailVerified) {
+        await saveSubmissionToFirestore(user.uid, record);
+        await clearActiveDraft(user.uid).catch(() => {});
+      }
       setSubmission(record);
       setStage('completion');
     } catch (err) {

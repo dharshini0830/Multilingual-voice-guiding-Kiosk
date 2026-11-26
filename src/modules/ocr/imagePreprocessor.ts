@@ -5,6 +5,9 @@ export interface PreprocessOptions {
 }
 
 export interface PreprocessedImageOutput {
+  aiDataUrl: string;
+  aiBase64: string;
+  aiMimeType: 'image/jpeg';
   colorDataUrl: string;
   colorBase64: string;
   colorMimeType: 'image/jpeg';
@@ -90,7 +93,7 @@ function stretchContrastPercentile(gray: Uint8ClampedArray): Uint8ClampedArray {
 
 function applyGentleSharpen(gray: Uint8ClampedArray, w: number, h: number): Uint8ClampedArray {
   const out = new Uint8ClampedArray(gray.length);
-  // Mild sharpening kernel so ID card guilloche backgrounds do not become speckles
+  // Crisp sharpening kernel tuned for webcam/mobile document photos
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = y * w + x;
@@ -98,18 +101,89 @@ function applyGentleSharpen(gray: Uint8ClampedArray, w: number, h: number): Uint
         out[idx] = gray[idx];
         continue;
       }
-      const center = gray[idx] * 1.4;
+      const center = gray[idx] * 1.68;
       const neighbors =
         (gray[(y - 1) * w + x] +
           gray[(y + 1) * w + x] +
           gray[y * w + (x - 1)] +
           gray[y * w + (x + 1)]) *
-        0.1;
+        0.17;
       const val = center - neighbors;
       out[idx] = val < 0 ? 0 : val > 255 ? 255 : Math.round(val);
     }
   }
   return out;
+}
+
+/**
+ * Enhances blurry/dim camera color frames on luminance only (preserving colors & accents)
+ * so both AI Vision and primary color Tesseract OCR see crisp character edges.
+ */
+function enhanceColorCameraRgba(rgba: Uint8ClampedArray, w: number, h: number): void {
+  const lum = new Float32Array(w * h);
+  const hist = new Uint32Array(256);
+
+  for (let i = 0, p = 0; i < rgba.length; i += 4, p++) {
+    const l = 0.299 * rgba[i] + 0.587 * rgba[i + 1] + 0.114 * rgba[i + 2];
+    lum[p] = l;
+    const bin = l < 0 ? 0 : l > 255 ? 255 : Math.round(l);
+    hist[bin]++;
+  }
+
+  // Gentle 1%..99% luminance levels normalization (fixes dim/low-contrast webcam lighting without clipping whites)
+  const total = w * h;
+  let cum = 0;
+  let low = 0;
+  let high = 255;
+  for (let i = 0; i < 256; i++) {
+    cum += hist[i];
+    if (cum >= total * 0.01) {
+      low = i;
+      break;
+    }
+  }
+  cum = 0;
+  for (let i = 255; i >= 0; i--) {
+    cum += hist[i];
+    if (cum >= total * 0.01) {
+      high = i;
+      break;
+    }
+  }
+
+  const doStretch = high - low >= 24 && (low > 12 || high < 238);
+  const scale = doStretch ? 255 / Math.max(24, high - low) : 1;
+
+  const stretched = new Float32Array(total);
+  for (let p = 0; p < total; p++) {
+    const l = doStretch ? Math.max(0, Math.min(255, (lum[p] - low) * scale)) : lum[p];
+    stretched[p] = l;
+  }
+
+  // Unsharp mask on luminance channel (5x5 box mean via row/col offsets approximated by 3x3 + 5-tap)
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const p = y * w + x;
+      const origLum = lum[p];
+      if (origLum < 1) continue;
+
+      const localBlur =
+        (stretched[p] * 2 +
+          stretched[p - 1] +
+          stretched[p + 1] +
+          stretched[p - w] +
+          stretched[p + w] +
+          (stretched[p - w - 1] + stretched[p - w + 1] + stretched[p + w - 1] + stretched[p + w + 1]) * 0.5) /
+        8;
+
+      const enhancedLum = Math.max(0, Math.min(255, stretched[p] + 0.48 * (stretched[p] - localBlur)));
+      const delta = enhancedLum - origLum;
+      const idx = p * 4;
+      rgba[idx] = Math.max(0, Math.min(255, Math.round(rgba[idx] + delta)));
+      rgba[idx + 1] = Math.max(0, Math.min(255, Math.round(rgba[idx + 1] + delta)));
+      rgba[idx + 2] = Math.max(0, Math.min(255, Math.round(rgba[idx + 2] + delta)));
+    }
+  }
 }
 
 function applyAdaptiveBinarization(gray: Uint8ClampedArray, w: number, h: number): Uint8ClampedArray {
@@ -163,12 +237,12 @@ export async function preprocessDocumentImage(
   const baseW = isRotated90 ? srcCropH : srcCropW;
   const baseH = isRotated90 ? srcCropW : srcCropH;
 
-  // Upscale small images so OCR sees crisp character glyphs, cap max at 1800px
+  // Upscale smaller/webcam images so OCR sees crisp character glyphs, cap max at 2000px
   let scale = 1;
-  if (baseW < 1400) {
-    scale = Math.min(2.2, 1400 / baseW);
-  } else if (baseW > 1800) {
-    scale = 1800 / baseW;
+  if (baseW < 1500) {
+    scale = Math.min(2.4, 1500 / baseW);
+  } else if (baseW > 2000) {
+    scale = 2000 / baseW;
   }
 
   const targetW = Math.max(1, Math.round(baseW * scale));
@@ -197,7 +271,34 @@ export async function preprocessDocumentImage(
   ctx.drawImage(img, srcCropX, srcCropY, srcCropW, srcCropH, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
 
-  // High-quality clean color image for AI Vision & primary color Tesseract pass
+  // Generate clean, artifact-free JPEG (max 1440px) for AI Vision OCR so Gemini sees natural typography
+  const aiMaxDim = 1440;
+  const aiScale = Math.max(targetW, targetH) > aiMaxDim ? aiMaxDim / Math.max(targetW, targetH) : 1;
+  let aiDataUrl: string;
+  if (aiScale < 1) {
+    const aiCanvas = document.createElement('canvas');
+    aiCanvas.width = Math.max(1, Math.round(targetW * aiScale));
+    aiCanvas.height = Math.max(1, Math.round(targetH * aiScale));
+    const aiCtx = aiCanvas.getContext('2d');
+    if (aiCtx) {
+      aiCtx.imageSmoothingEnabled = true;
+      aiCtx.imageSmoothingQuality = 'high';
+      aiCtx.drawImage(canvas, 0, 0, aiCanvas.width, aiCanvas.height);
+      aiDataUrl = aiCanvas.toDataURL('image/jpeg', 0.88);
+    } else {
+      aiDataUrl = canvas.toDataURL('image/jpeg', 0.88);
+    }
+  } else {
+    aiDataUrl = canvas.toDataURL('image/jpeg', 0.88);
+  }
+  const aiBase64 = aiDataUrl.split(',')[1] ?? '';
+
+  // Apply luminance-only edge sharpening & mild contrast normalization for local Tesseract OCR
+  const colorImgData = ctx.getImageData(0, 0, targetW, targetH);
+  enhanceColorCameraRgba(colorImgData.data, targetW, targetH);
+  ctx.putImageData(colorImgData, 0, 0);
+
+  // High-quality crisp color image for primary color Tesseract pass
   const colorDataUrl = canvas.toDataURL('image/jpeg', 0.92);
   const colorBase64 = colorDataUrl.split(',')[1] ?? '';
 
@@ -218,7 +319,7 @@ export async function preprocessDocumentImage(
   // 3. Contrast stretch (2%-98%)
   gray = stretchContrastPercentile(gray);
 
-  // 4. Gentle sharpening
+  // 4. Sharpening tuned for card typography
   gray = applyGentleSharpen(gray, targetW, targetH);
 
   // Write enhanced grayscale image
@@ -246,6 +347,9 @@ export async function preprocessDocumentImage(
   const binarizedDataUrl = canvas.toDataURL('image/png');
 
   return {
+    aiDataUrl,
+    aiBase64,
+    aiMimeType: 'image/jpeg',
     colorDataUrl,
     colorBase64,
     colorMimeType: 'image/jpeg',
